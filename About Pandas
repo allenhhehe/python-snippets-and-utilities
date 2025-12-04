@@ -1,0 +1,291 @@
+ Pandas 实战升级版（含常见坑 + 端到端例子，可直接复制到微信）
+目标：让你做“爬/读数据 → 清洗 → 特征 → 汇总 → 画图 → 训练 → 导出”时，知道用哪些 Pandas 函数、哪里会踩坑。
+
+============================================================
+A. 你最该掌握的 Pandas 心法（先背这 8 句）
+============================================================
+1) DataFrame 是“表”，Series 是“一列/一行”；大多数操作都是“对列做向量化”
+2) 先 df.info() + df.isna().sum() + df.head() 进行体检
+3) 读入时就指定 dtype/parse_dates/encoding，能省 70% 的坑
+4) 清洗顺序：列名统一 → 类型转换 → 缺失处理 → 去重 → 异常值 → 文本清洗
+5) 尽量少用 apply(axis=1)，优先用向量化 / str / dt / groupby
+6) merge/concat 是 SQL 的 join/union；做项目离不开
+7) 变形：melt（宽转长）/ pivot_table（长转宽+聚合）是 BI/建模常用
+8) 降低心智负担：把流程拆成 raw -> clean -> features -> model 四层文件
+
+============================================================
+B. 读入数据（I/O）超级常用参数 + 坑
+============================================================
+
+B1) read_csv：99% 项目从这开始
+df = pd.read_csv(
+    "raw.csv",
+    encoding="utf-8",
+    sep=",",
+    dtype={"id":"string"},
+    parse_dates=["date"],
+    na_values=["", "NA", "null", "None"],
+    on_bad_lines="skip",
+)
+
+【常见坑】
+- 乱码：日本很多 CSV 是 cp932/shift_jis
+  df = pd.read_csv("x.csv", encoding="cp932")
+- UTF-8 BOM：encoding="utf-8-sig"
+- 数字列里混了逗号/货币符号：后面用 to_numeric(errors="coerce")
+- 大文件内存爆：chunksize=100000 分块读
+  for chunk in pd.read_csv("big.csv", chunksize=100000): ...
+
+B2) 写出：做端到端一定要“落中间层”
+df.to_csv("clean.csv", index=False)
+df.to_parquet("clean.parquet", index=False)   # 更快更小，强烈推荐
+
+============================================================
+C. 快速体检（每次读完都做）
+============================================================
+df.head(3)
+df.shape
+df.info()
+df.isna().sum().sort_values(ascending=False).head(20)
+df.duplicated().sum()
+df.nunique().sort_values().head(10)
+
+【常见坑】
+- “看起来没缺失”但其实有空字符串：先 replace 空字符串为 NA
+  df = df.replace({"": pd.NA, " ": pd.NA})
+
+============================================================
+D. 选择/过滤（loc / iloc / query）
+============================================================
+D1) 基本过滤（最常用）
+df_tokyo = df[df["city"] == "Tokyo"]
+
+D2) 多条件：注意括号，&/| 不能用 and/or
+df2 = df[(df["age"]>=30) & (df["city"]=="Tokyo")]
+
+D3) loc 行列选择（按标签）
+df.loc[0:9, ["a","b"]]
+
+D4) iloc 行列选择（按位置）
+df.iloc[0:10, 0:2]
+
+D5) query（条件多时更清爽）
+df.query("age >= 30 and city == 'Tokyo'")
+
+【常见坑】
+- SettingWithCopyWarning（链式赋值）
+  错：df[df["x"]>0]["y"]=1
+  对：df.loc[df["x"]>0, "y"] = 1
+
+============================================================
+E. 清洗五件套（列名/类型/缺失/重复/文本）
+============================================================
+
+E1) 统一列名（强烈建议做）
+df.columns = (df.columns
+              .str.strip()
+              .str.lower()
+              .str.replace(r"\s+", "_", regex=True))
+
+E2) 类型转换（最常用）
+df["id"] = df["id"].astype("string")
+df["age"] = pd.to_numeric(df["age"], errors="coerce")  # 脏数字列
+df["ts"]  = pd.to_datetime(df["ts"], errors="coerce")  # 脏日期列
+
+【坑】astype("int64") 遇到 NA 会报错 → 用 "Int64"（可空整数）
+df["age"] = df["age"].astype("Int64")
+
+E3) 缺失处理
+df.isna().sum()
+df["price"] = df["price"].fillna(0)
+df = df.dropna(subset=["target"])  # 目标列缺失通常直接丢
+
+【坑】fillna 要有业务意义：价格缺失填 0 可能不合理
+
+E4) 去重
+df = df.drop_duplicates(subset=["id"], keep="first")
+
+E5) 文本清洗（Series.str）
+df["name"] = (df["name"].astype("string")
+              .str.strip()
+              .str.replace(r"\s+", " ", regex=True))
+
+例：只保留数字（电话）
+df["phone"] = (df["phone"].astype("string")
+               .str.replace(r"\D+", "", regex=True))
+
+============================================================
+F. 新列/特征工程（向量化优先）
+============================================================
+
+F1) 向量化计算
+df["total"] = df["price"] * df["qty"]
+
+F2) 条件列（np.where）
+df["vip"] = np.where(df["total"] > 10000, 1, 0)
+
+F3) 分箱（cut / qcut）
+df["age_bin"] = pd.cut(df["age"], bins=[0,18,30,45,60,200], right=False)
+df["income_q"] = pd.qcut(df["income"], q=4, labels=["Q1","Q2","Q3","Q4"])
+
+【坑】
+- qcut 遇到重复边界可能报错：加 duplicates="drop"
+  pd.qcut(df["x"], q=10, duplicates="drop")
+
+============================================================
+G. groupby 聚合（最常用的商业分析/特征）
+============================================================
+
+G1) 基本
+df.groupby("city")["sales"].sum()
+
+G2) 一次产出多指标（推荐写法）
+out = (df.groupby(["city","category"])
+       .agg(
+           sales_sum=("sales","sum"),
+           sales_mean=("sales","mean"),
+           cnt=("sales","size"),
+       )
+       .reset_index())
+
+G3) transform（组内特征：返回长度=原表）
+df["city_mean_sales"] = df.groupby("city")["sales"].transform("mean")
+df["sales_vs_city"] = df["sales"] - df["city_mean_sales"]
+
+【坑】
+- size vs count
+  size：包含 NA 的行数
+  count：不包含 NA 的数量
+
+============================================================
+H. 拼表（merge / concat）——端到端项目必备
+============================================================
+
+H1) merge（SQL join）
+df = df.merge(user_df, on="user_id", how="left")
+
+常见参数：
+- on=["id","date"] 多键
+- left_on/right_on：左右键名不同
+- suffixes=("_l","_r") 合并重名列
+
+【坑】
+- 合并后行数突然变大：多对多 join 了（duplicates key）
+  先检查：left["id"].duplicated().sum()
+
+H2) concat（上下追加 / 左右拼列）
+df_all  = pd.concat([df1, df2], ignore_index=True)  # 纵向追加
+df_wide = pd.concat([a, b], axis=1)                 # 横向拼列
+
+============================================================
+I. 变形（melt / pivot_table）——做图/训练很常用
+============================================================
+
+I1) 宽转长：melt（可视化/特征）
+long = df.melt(
+    id_vars=["id"],
+    value_vars=["a","b","c"],
+    var_name="feature",
+    value_name="value"
+)
+
+I2) 长转宽：pivot_table（带聚合）
+pt = pd.pivot_table(
+    df,
+    values="sales",
+    index="city",
+    columns="category",
+    aggfunc="sum",
+    fill_value=0
+)
+
+============================================================
+J. 时间序列（dt / resample / rolling）
+============================================================
+
+J1) dt 提取时间字段
+df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+df["date"] = df["ts"].dt.date
+df["hour"] = df["ts"].dt.hour
+df["dow"]  = df["ts"].dt.dayofweek
+
+J2) resample（按天/小时聚合）
+ts = df.set_index("ts").sort_index()
+daily = ts["sales"].resample("D").sum()
+
+J3) rolling（移动平均）
+ts["ma7"] = ts["sales"].rolling(7, min_periods=1).mean()
+
+【坑】
+- resample 需要 DatetimeIndex：一定要 set_index("ts") 且 ts 要 datetime
+
+============================================================
+K. 端到端实战例子（从“网上/文件数据”到“可用输出”）
+============================================================
+
+假设你抓到一个 raw.csv，有列：
+- url, title, price, qty, ts, category, city
+
+K1) 读 raw + 体检
+df = pd.read_csv("raw.csv", encoding="utf-8")
+df.info()
+print(df.isna().sum().sort_values(ascending=False).head(10))
+
+K2) 清洗（最小但完整）
+df.columns = (df.columns.str.strip().str.lower())
+df = df.replace({"": pd.NA, " ": pd.NA})
+
+df["price"] = (df["price"].astype("string")
+               .str.replace(r"[^\d\.]", "", regex=True))     # 去货币符号
+df["price"] = pd.to_numeric(df["price"], errors="coerce")
+
+df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
+df["ts"]  = pd.to_datetime(df["ts"], errors="coerce")
+
+df = df.drop_duplicates(subset=["url"])
+df = df.dropna(subset=["price","qty","ts"])
+
+K3) 特征（features）
+df["total"] = df["price"] * df["qty"]
+df["dow"] = df["ts"].dt.dayofweek
+df["month"] = df["ts"].dt.month
+
+# 组内特征：每个 city 的平均 total
+df["city_mean_total"] = df.groupby("city")["total"].transform("mean")
+df["total_vs_city"] = df["total"] - df["city_mean_total"]
+
+K4) 输出 clean + summary（给后面训练/汇报用）
+df.to_parquet("clean.parquet", index=False)
+
+summary = (df.groupby(["city","category"])
+             .agg(
+                 total_sum=("total","sum"),
+                 total_mean=("total","mean"),
+                 cnt=("total","size"),
+             )
+             .reset_index())
+
+summary.to_csv("summary.csv", index=False)
+
+K5) （可选）做一个训练用表
+# 例：把类别做 one-hot
+X = pd.get_dummies(df[["price","qty","dow","month","category","city"]], drop_first=True)
+y = df["total"]
+
+# 这一步可以交给 sklearn：train_test_split + model.fit + metrics
+
+============================================================
+L. “初级工程化”最小清单（你别被吓到）
+============================================================
+你只要做到这些，就已经超过很多只会 notebook 的人：
+1) raw/clean 分层存文件（raw.csv -> clean.parquet）
+2) train.py / evaluate.py 分文件（不是全写 notebook）
+3) README 写三行命令：安装/运行/输出在哪里
+4) pytest 只写 1-3 个最关键测试（例如：清洗后 price 不为负、没有重复 url）
+5) GitHub Actions 跑 pytest（复制模板改两行即可）
+
+============================================================
+M. 复制到微信的技巧（iPhone/APP常见）
+============================================================
+- 复制长文本容易失败：优先用我生成的 txt 文件，打开后“全选→复制”
+- 或者把文本分段复制（但 txt 最稳）
